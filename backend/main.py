@@ -299,6 +299,197 @@ async def transcribe(request: Request, question: str = ""):
             os.remove(tmp_path)
 
 
+# ------------------------------------------------------------
+# ANSWER EVALUATION (strict) - used by /evaluate
+#
+# The AI only decides WHICH key points the answer really covers.
+# The score is then calculated HERE in Python:
+#     score = (covered key points / all key points) x 10
+# so a wrong or irrelevant answer can never get "random partial marks".
+# ------------------------------------------------------------
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2:3b"
+
+WRONG_PENALTY = 1.0   # marks (out of 10) removed for every wrong statement
+CORRECT_LIMIT = 0.8   # 80% or more of the key points covered = "Correct"
+
+NO_ANSWER_PATTERNS = [
+    r"^\s*(i\s*)?(do\s*not|don'?t)\s*know\s*\.?\s*$",
+    r"^\s*(no\s*idea|not\s*sure|idk|skip|pass|nothing|n/?a)\s*\.?\s*$",
+    r"^\s*(pata\s*nahi|pata\s*nhi|nahi\s*pata|nhi\s*pata|malum\s*nahi)\s*\.?\s*$",
+]
+
+
+# very common words: a real answer almost always contains at least one of them
+COMMON_WORDS = {
+    "the", "an", "is", "are", "was", "were", "be", "been", "to", "of", "in", "on",
+    "at", "for", "with", "by", "from", "and", "or", "but", "not", "it", "its",
+    "this", "that", "these", "those", "as", "can", "will", "used", "use", "uses",
+    "using", "you", "we", "they", "he", "she", "my", "your", "our", "their",
+    "which", "what", "when", "where", "why", "how", "who", "if", "then", "than",
+    "so", "also", "do", "does", "did", "has", "have", "had", "into", "about",
+    "more", "one", "all", "any", "some", "each", "like", "between", "there",
+    "here", "them", "very", "just", "only", "other", "such", "may", "should",
+    "would", "could", "means", "mean", "called", "known", "way", "type",
+    # Hinglish
+    "hai", "hain", "ka", "ke", "ki", "ko", "se", "me", "mein", "par", "aur",
+    "ye", "yeh", "wo", "woh", "jab", "tha", "hota", "hoti", "hote", "kar",
+    "karta", "karte", "liye", "nahi", "nhi", "bhi",
+}
+
+
+def _plain_words(text):
+    words = re.findall(r"[A-Za-z][A-Za-z0-9+#.]*", text or "")
+    return [w.lower().rstrip(".") for w in words]
+
+
+def _is_junk_answer(answer, question=""):
+    """True for answers that need no AI check:
+    symbols, random letters, 'I don't know', or an answer that only repeats the question."""
+
+    text = (answer or "").strip()
+
+    if len(re.findall(r"[A-Za-z]", text)) < 3:
+        return True
+
+    for pattern in NO_ANSWER_PATTERNS:
+        if re.match(pattern, text, flags=re.IGNORECASE):
+            return True
+
+    words = _plain_words(text)
+
+    if not words:
+        return True
+
+    question_words = set(_plain_words(question))
+
+    # random letters like "edhwgewg wehgdhb": no common word and nothing from the question
+    has_common_word = any(w in COMMON_WORDS for w in words)
+    uses_question_word = any(
+        w in question_words and w not in COMMON_WORDS for w in words
+    )
+
+    if not has_common_word and not uses_question_word:
+        return True
+
+    # the answer only repeats words of the question
+    content_words = [w for w in words if w not in COMMON_WORDS and len(w) >= 3]
+
+    if content_words and all(w in question_words for w in content_words):
+        return True
+
+    tokens = [w.lower() for w in text.split()]
+
+    if len(tokens) >= 4 and len(set(tokens)) == 1:
+        return True
+
+    return False
+
+
+def _is_real_attempt(question, answer):
+    """Short yes/no check by the AI: is this a real, on-topic attempt?
+    If the AI cannot be reached, nothing is blocked here."""
+
+    prompt = f"""You check interview answers.
+
+QUESTION:
+{question}
+
+CANDIDATE ANSWER:
+{answer}
+
+Is the candidate answer a real attempt that talks about the topic of the question in meaningful words?
+
+Set "relevant" to false if the answer is random letters, gibberish, about a different topic, a joke, or only repeats the question.
+Set "relevant" to true only if it is a genuine attempt at answering this question (even if it is wrong or incomplete).
+
+Return ONLY this JSON: {{"relevant": true}} or {{"relevant": false}}
+"""
+
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": 0, "num_predict": 30}
+            },
+            timeout=60
+        )
+
+        response.raise_for_status()
+
+        return json.loads(response.json()["response"]).get("relevant") is not False
+
+    except Exception as error:
+        print("Relevance check error:", error)
+        return True
+
+
+def _word_set(text):
+    return set(re.findall(r"[a-z0-9+#]{3,}", (text or "").lower()))
+
+
+def _evidence_ok(evidence, answer):
+    """The AI must copy the part of the answer that proves a key point.
+    If those words are not really in the answer, the point does not count."""
+
+    evidence_words = _word_set(str(evidence or ""))
+
+    if not evidence_words:
+        return False
+
+    found = len(evidence_words & _word_set(answer))
+
+    return found / len(evidence_words) >= 0.6
+
+
+def _build_eval_prompt(role, level, question, answer):
+    return f"""You are a STRICT technical interview evaluator.
+
+ROLE: {role}
+LEVEL: {level}
+
+QUESTION:
+{question}
+
+CANDIDATE ANSWER:
+{answer}
+
+Do these steps:
+
+1. Write 3 to 5 KEY POINTS that a correct answer to this question must contain.
+   Each key point must be a short, specific technical fact.
+
+2. For each key point decide if the candidate answer states it correctly.
+   - covered = true ONLY if the answer clearly and correctly says it.
+     Copy the exact words from the candidate answer that prove it into "evidence".
+   - covered = false if the answer is vague, off-topic, wrong, or only repeats
+     words from the question. Then "evidence" must be "".
+   - Different wording is fine, but the idea must be correct.
+   - A short answer can still cover every key point.
+
+3. In "wrong_statements" list every statement in the answer that is technically WRONG.
+
+4. In "feedback" write 1 or 2 simple sentences: what is right and what is wrong or missing.
+   If nothing is correct, say clearly that the answer is incorrect.
+
+Return ONLY valid JSON in exactly this format:
+
+{{
+  "key_points": [
+    {{"point": "short key point", "covered": true, "evidence": "words copied from the answer"}},
+    {{"point": "short key point", "covered": false, "evidence": ""}}
+  ],
+  "wrong_statements": [],
+  "feedback": ""
+}}
+"""
+
+
 @app.post("/evaluate")
 async def evaluate(data: dict):
 
@@ -325,120 +516,94 @@ async def evaluate(data: dict):
             })
             continue
 
-        prompt = f"""
-You are an expert technical interview evaluator.
+        # symbols / random letters / "I don't know" / repeating the question -> 0, no AI needed
+        # then a quick AI yes/no check that the answer is really about the question
+        if _is_junk_answer(answer, question) or not _is_real_attempt(question, answer):
+            results.append({
+                "question": question,
+                "answer": answer,
+                "score": 0,
+                "status": "Incorrect",
+                "feedback": "This is not a valid or relevant answer to the question.",
+                "missing_points": ["A relevant technical answer is required."]
+            })
+            continue
 
-ROLE:
-{role}
-
-LEVEL:
-{level}
-
-QUESTION:
-{question}
-
-CANDIDATE ANSWER:
-{answer}
-
-Evaluate ONLY the candidate's answer to this question.
-
-First determine the important concepts that a good {level} candidate should mention.
-
-Then compare the candidate answer against those concepts.
-
-IMPORTANT:
-- Do NOT penalize the candidate simply because the answer is short.
-- Do NOT require every possible detail.
-- If the core technical concept is correct, give appropriate credit.
-- Minor wording differences are acceptable.
-- Do not invent missing concepts.
-- Only list a missing point if it is genuinely important to answering the question.
-- Do not use labels like "Missing concept 1", "Missing concept 2".
-- Give higher scores when the answer is technically correct.
-- Give partial scores when the core idea is correct but important details are missing.
-- Give low scores only when the answer is substantially incorrect or irrelevant.
-
-Scoring:
-
-9-10 = Excellent and technically complete
-7-8 = Correct with minor omissions
-5-6 = Partially correct with important omissions
-3-4 = Major misunderstanding
-0-2 = Incorrect or irrelevant
-
-Return ONLY valid JSON in exactly this structure:
-
-{{
-  "score": 0,
-  "status": "Correct",
-  "feedback": "Clear explanation of why the answer received this score.",
-  "missing_points": []
-}}
-
-Allowed status values:
-
-"Correct"
-"Partially Correct"
-"Incorrect"
-
-Rules for missing_points:
-
-- Use [] when nothing important is missing.
-- Mention only real missing technical concepts.
-- Maximum 3 items.
-- Never write generic labels such as "Missing concept 1".
-"""
+        prompt = _build_eval_prompt(role, level, question, answer)
 
         try:
 
             response = requests.post(
-                "http://localhost:11434/api/generate",
+                OLLAMA_URL,
                 json={
-                    "model": "llama3.2:3b",
+                    "model": OLLAMA_MODEL,
                     "prompt": prompt,
                     "stream": False,
-                    "format": "json"
+                    "format": "json",
+                    "options": {"temperature": 0}
                 },
                 timeout=120
             )
 
             response.raise_for_status()
 
-            ai_data = response.json()
+            evaluation = json.loads(response.json()["response"])
 
-            evaluation = json.loads(
-                ai_data["response"]
-            )
+            points = evaluation.get("key_points") or []
 
-            score = float(
-                evaluation.get("score", 0)
-            )
+            if not isinstance(points, list):
+                points = []
 
-            score = max(0, min(10, score))
+            covered = []
+            missing = []
 
-            status = evaluation.get(
-                "status",
-                "Partially Correct"
-            )
+            for point in points:
+                if not isinstance(point, dict):
+                    continue
 
-            feedback = evaluation.get(
-                "feedback",
-                ""
-            )
+                text = str(point.get("point", "")).strip()
 
-            missing_points = evaluation.get(
-                "missing_points",
-                []
-            )
+                if not text:
+                    continue
 
-            if not isinstance(missing_points, list):
-                missing_points = []
+                if point.get("covered") is True and _evidence_ok(point.get("evidence"), answer):
+                    covered.append(text)
+                else:
+                    missing.append(text)
 
-            missing_points = [
-                str(point)
-                for point in missing_points
-                if point
-            ][:3]
+            wrong = evaluation.get("wrong_statements") or []
+
+            if not isinstance(wrong, list):
+                wrong = []
+
+            wrong = [str(w).strip() for w in wrong if str(w).strip()]
+
+            total_points = len(covered) + len(missing)
+
+            # ---- the score is calculated here, not by the AI ----
+            if total_points == 0 or not covered:
+                score = 0.0
+            else:
+                score = 10 * len(covered) / total_points
+                score -= WRONG_PENALTY * len(wrong)
+                score = max(0.0, min(10.0, round(score, 1)))
+
+            if score <= 0:
+                status = "Incorrect"
+            elif len(covered) / total_points >= CORRECT_LIMIT and not wrong:
+                status = "Correct"
+            else:
+                status = "Partially Correct"
+
+            feedback = str(evaluation.get("feedback") or "").strip()
+
+            if score <= 0:
+                feedback = "Incorrect answer. It does not correctly answer what the question asks."
+
+                if wrong:
+                    feedback += f" Wrong: {wrong[0]}"
+            elif not feedback:
+                feedback = "Some key points are correct, but important points are missing."
 
             results.append({
                 "question": question,
@@ -446,7 +611,7 @@ Rules for missing_points:
                 "score": score,
                 "status": status,
                 "feedback": feedback,
-                "missing_points": missing_points
+                "missing_points": missing[:3]
             })
 
             total_score += score

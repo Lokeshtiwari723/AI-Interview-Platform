@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+edge-tts
+requests
+faster-whisper
+numpy
