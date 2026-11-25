@@ -144,7 +144,7 @@ console.log("QUESTIONS:", currentQuestions);
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:8000/speak?text=${encodeURIComponent(text)}`
+        `backend/speak?text=${encodeURIComponent(text)}`
       );
 
       if (!response.ok) {
